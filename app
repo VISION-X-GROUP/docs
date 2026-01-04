@@ -1,508 +1,219 @@
-import os
-import sqlite3
-import threading
-import time
-import json
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from enum import Enum
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_file
-from flask_socketio import SocketIO, emit
-from werkzeug.security import generate_password_hash, check_password_hash
-from fpdf import FPDF
-import openai
-from dotenv import load_dotenv
-
-# تحميل متغيرات البيئة
-load_dotenv()
-
-# إعداد التسجيل
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('company.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# ===========================================
-# تعريفات الأنواع والمتغيرات
-# ===========================================
-
-class TaskStatus(Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-class BotStatus(Enum):
-    AVAILABLE = "available"
-    BUSY = "busy"
-    TRAINING = "training"
-    OFFLINE = "offline"
-
-@dataclass
-class Task:
-    id: int
-    dept: str
-    description: str
-    skill_required: str
-    priority: int  # 1-5 (5 هو الأعلى)
-    estimated_time: int  # بالدقائق
-    assigned_to: Optional[int]
-    status: TaskStatus
-    created_at: datetime
-    completed_at: Optional[datetime]
-
-@dataclass
-class PerformanceMetrics:
-    bot_id: int
-    task_id: int
-    efficiency_score: float  # 0-100%
-    completion_time: int  # بالثواني
-    accuracy_score: float  # 0-100%
-    learning_gain: float  # 0-1
-    timestamp: datetime
-
-# ===========================================
-# قاعدة البيانات المحسنة
-# ===========================================
-
-def init_db():
-    """تهيئة قاعدة البيانات مع الجداول المحسنة"""
-    conn = sqlite3.connect('company.db')
-    c = conn.cursor()
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VISION-X Group | هندسة الحضارة القادمة</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
     
-    # جدول الموظفين (البوتات)
-    c.execute('''CREATE TABLE IF NOT EXISTS employees
-                (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                dept TEXT NOT NULL,
-                skills TEXT NOT NULL,
-                status TEXT DEFAULT 'active',
-                experience_level INTEGER DEFAULT 1,
-                total_tasks_completed INTEGER DEFAULT 0,
-                avg_efficiency REAL DEFAULT 0.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # جدول المهام المحسن
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks
-                (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                dept TEXT NOT NULL,
-                task_description TEXT NOT NULL,
-                skill_required TEXT NOT NULL,
-                priority INTEGER DEFAULT 3,
-                estimated_time INTEGER DEFAULT 60,
-                assigned_to INTEGER,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP,
-                completed_at TIMESTAMP,
-                result_data TEXT,
-                FOREIGN KEY(assigned_to) REFERENCES employees(id))''')
-    
-    # جدول الأداء والتقارير
-    c.execute('''CREATE TABLE IF NOT EXISTS performance
-                (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER NOT NULL,
-                task_id INTEGER NOT NULL,
-                efficiency_score REAL DEFAULT 0.0,
-                completion_time INTEGER DEFAULT 0,
-                accuracy_score REAL DEFAULT 0.0,
-                learning_gain REAL DEFAULT 0.0,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(bot_id) REFERENCES employees(id),
-                FOREIGN KEY(task_id) REFERENCES tasks(id))''')
-    
-    # جدول الأهداف
-    c.execute('''CREATE TABLE IF NOT EXISTS goals
-                (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                department TEXT NOT NULL,
-                goal_text TEXT NOT NULL,
-                priority INTEGER DEFAULT 3,
-                status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                deadline TIMESTAMP,
-                completed_at TIMESTAMP)''')
-    
-    # جدول التعلم الآلي
-    c.execute('''CREATE TABLE IF NOT EXISTS learning_data
-                (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_id INTEGER NOT NULL,
-                task_type TEXT NOT NULL,
-                success_count INTEGER DEFAULT 0,
-                failure_count INTEGER DEFAULT 0,
-                avg_completion_time REAL DEFAULT 0.0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(bot_id) REFERENCES employees(id))''')
-    
-    # إضافة بيانات أولية إذا كانت الجداول فارغة
-    if not c.execute('SELECT 1 FROM employees LIMIT 1').fetchone():
-        initial_bots = [
-            ('بوت التسويق الذكي 1', 'marketing', 'تحليل السوق,إعلانات,وسائل التواصل الاجتماعي,SEO', 3),
-            ('بوت التسويق الذكي 2', 'marketing', 'إعلانات,تحليلات,كتابة محتوى,إدارة الحملات', 2),
-            ('بوت التطوير المتقدم 1', 'development', 'بايثون,فلاسك,React,قواعد البيانات', 4),
-            ('بوت التطوير المتقدم 2', 'development', 'جافاسكريبت,HTML,CSS,Node.js', 3),
-            ('بوت الماليات الذكي', 'finance', 'تحليل مالي,المحاسبة,التقارير,التنبؤ', 3),
-            ('بوت الموارد البشرية الذكي', 'hr', 'التوظيف,التدريب,إدارة الأداء,التواصل', 2),
-            ('بوت العمليات المتقدم', 'operations', 'إدارة العمليات,اللوجستيات,التخطيط,المراقبة', 3),
-            ('بوت التحليلات الذكي', 'analytics', 'تحليل البيانات,التقارير,التصور,التنبؤ', 4)
-        ]
-        
-        for name, dept, skills, level in initial_bots:
-            c.execute('''INSERT INTO employees (name, dept, skills, experience_level) 
-                        VALUES (?, ?, ?, ?)''', (name, dept, skills, level))
-        
-        # إضافة مهام أولية
-        sample_tasks = [
-            ('marketing', 'تحليل أداء الحملة التسويقية الأخيرة', 'تحليل السوق', 4, 120),
-            ('development', 'تطوير واجهة جديدة لنظام الإدارة', 'بايثون', 5, 240),
-            ('finance', 'إعداد تقرير الربع الأول', 'تحليل مالي', 3, 180),
-            ('analytics', 'تحليل بيانات العملاء لتحديد الاتجاهات', 'تحليل البيانات', 4, 150)
-        ]
-        
-        for dept, desc, skill, priority, time in sample_tasks:
-            c.execute('''INSERT INTO tasks (dept, task_description, skill_required, priority, estimated_time)
-                        VALUES (?, ?, ?, ?, ?)''', (dept, desc, skill, priority, time))
-    
-    conn.commit()
-    conn.close()
-    logger.info("تم تهيئة قاعدة البيانات بنجاح")
-
-def get_db():
-    """الحصول على اتصال بقاعدة البيانات"""
-    conn = sqlite3.connect('company.db')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# ===========================================
-# نظام إدارة المهام الذكي
-# ===========================================
-
-class SmartTaskAssigner:
-    """نظام ذكي لتعيين المهام"""
-    
-    def __init__(self):
-        self.task_queue = []
-        self.learning_data = {}
-        logger.info("تم تهيئة SmartTaskAssigner")
-    
-    def assign_based_on_skills(self, task_data: Dict) -> Optional[int]:
-        """تعيين المهام بناءً على مهارات البوت"""
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            
-            # البحث عن البوتات المناسبة
-            query = '''SELECT * FROM employees 
-                      WHERE dept = ? 
-                      AND skills LIKE ? 
-                      AND status = 'active'
-                      ORDER BY experience_level DESC, avg_efficiency DESC'''
-            
-            c.execute(query, (task_data['dept'], f"%{task_data['skill_required']}%"))
-            bots = c.fetchall()
-            
-            if bots:
-                # اختيار أفضل بوت
-                best_bot = self.calculate_best_fit(bots, task_data)
-                
-                if best_bot:
-                    # تحديث المهمة
-                    c.execute('''UPDATE tasks SET assigned_to = ?, status = 'in_progress', started_at = ?
-                                WHERE id = ?''', 
-                            (best_bot['id'], datetime.now(), task_data.get('task_id')))
-                    
-                    # تحديث حالة البوت
-                    c.execute('''UPDATE employees SET status = 'busy', last_active = ?
-                                WHERE id = ?''', 
-                            (datetime.now(), best_bot['id']))
-                    
-                    conn.commit()
-                    
-                    # إرسال تحديث عبر WebSocket
-                    socketio.emit('task_assigned', {
-                        'task_id': task_data.get('task_id'),
-                        'bot_id': best_bot['id'],
-                        'bot_name': best_bot['name'],
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    logger.info(f"تم تعيين المهمة {task_data.get('task_id')} إلى البوت {best_bot['name']}")
-                    return best_bot['id']
-            
-            conn.close()
-            return None
-            
-        except Exception as e:
-            logger.error(f"خطأ في تعيين المهمة: {str(e)}")
-            return None
-    
-    def calculate_best_fit(self, bots, task_data: Dict) -> Optional[sqlite3.Row]:
-        """حساب أفضل بوت للمهمة"""
-        try:
-            scores = []
-            
-            for bot in bots:
-                score = 0
-                
-                # 1. المهارات المطابقة (40%)
-                bot_skills = bot['skills'].split(',')
-                required_skills = task_data.get('skill_required', '').split(',')
-                matching_skills = set(bot_skills) & set(required_skills)
-                skill_score = (len(matching_skills) / max(len(required_skills), 1)) * 40
-                score += skill_score
-                
-                # 2. الخبرة (25%)
-                experience_score = min(bot['experience_level'] * 5, 25)
-                score += experience_score
-                
-                # 3. الكفاءة (20%)
-                efficiency_score = (bot['avg_efficiency'] / 100) * 20
-                score += efficiency_score
-                
-                # 4. الوقت المتاح (15%)
-                conn = get_db()
-                c = conn.cursor()
-                c.execute('SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND status = "in_progress"', 
-                         (bot['id'],))
-                current_tasks = c.fetchone()[0]
-                conn.close()
-                
-                availability_score = max(0, 15 - (current_tasks * 3))
-                score += availability_score
-                
-                # 5. التعلم السابق (إضافة إضافية)
-                task_type = self.classify_task(task_data['task_description'])
-                learning_bonus = self.get_learning_bonus(bot['id'], task_type)
-                score += learning_bonus
-                
-                scores.append({
-                    'bot': bot,
-                    'score': score,
-                    'details': {
-                        'skill_score': skill_score,
-                        'experience_score': experience_score,
-                        'efficiency_score': efficiency_score,
-                        'availability_score': availability_score,
-                        'learning_bonus': learning_bonus
-                    }
-                })
-            
-            # اختيار البوت بأعلى درجة
-            if scores:
-                best = max(scores, key=lambda x: x['score'])
-                logger.debug(f"Best bot selected: {best['bot']['name']} with score {best['score']}")
-                return best['bot']
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"خطأ في حساب أفضل بوت: {str(e)}")
-            return None
-    
-    def classify_task(self, task_description: str) -> str:
-        """تصنيف المهمة"""
-        keywords = {
-            'تحليل': 'analysis',
-            'تطوير': 'development',
-            'تسويق': 'marketing',
-            'مبيعات': 'sales',
-            'مالي': 'finance',
-            'محتوى': 'content',
-            'برمجة': 'programming',
-            'بيانات': 'data',
-            'تدريب': 'training',
-            'إدارة': 'management'
+    <style>
+        /* تعريف تأثير الزجاج (Glass Effect) */
+        .glass-effect {
+            background-color: rgba(12, 13, 18, 0.8);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
         }
+        /* تأثير التدرج النيوني للخط (Neon Gradient) */
+        .neon-gradient {
+            background-clip: text;
+            -webkit-background-clip: text;
+            color: transparent;
+            /* تدرج من الأبيض إلى الأزرق/البنفسجي */
+            background-image: linear-gradient(to right, #ffffff, #a5b4fc, #818cf8, #7c3aed);
+        }
+    </style>
+</head>
+<body class="bg-[#0c0d12] text-gray-100 font-sans min-h-screen">
+
+    <div id="root" class="flex flex-col min-h-screen">
         
-        for key, value in keywords.items():
-            if key in task_description:
-                return value
-        return 'general'
-    
-    def get_learning_bonus(self, bot_id: int, task_type: str) -> float:
-        """الحصول على مكافأة التعلم"""
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute('''SELECT success_count, failure_count, avg_completion_time 
-                        FROM learning_data 
-                        WHERE bot_id = ? AND task_type = ?''', 
-                     (bot_id, task_type))
+        <header class="glass-effect shadow-xl sticky top-0 z-50 border-b border-gray-800">
+            <div class="container mx-auto max-w-[1300px] flex justify-between items-center p-4">
+                <a href="#vision" class="relative group">
+                    <span class="text-3xl sm:text-4xl font-black tracking-widest text-transparent neon-gradient transition-all duration-500 group-hover:to-purple-500">
+                        VISION-X
+                    </span>
+                    <span class="absolute -bottom-1 left-0 w-0 h-0.5 bg-indigo-500 transition-all duration-300 group-hover:w-full"></span>
+                </a>
+                <nav class="hidden md:flex items-center gap-8 text-lg font-semibold">
+                    <a href="#vision" class="text-gray-300 hover:text-indigo-400 transition duration-300">الرؤية الموحدة</a>
+                    <a href="#arms" class="text-gray-300 hover:text-indigo-400 transition duration-300">VISION-X Space</a>
+                    <a href="#arms" class="text-gray-300 hover:text-indigo-400 transition duration-300">VISION-X Energy</a>
+                    <a href="#arms" class="text-gray-300 hover:text-indigo-400 transition duration-300">VISION-X Deep-Tech</a>
+                    <a href="#contact" class="text-gray-300 hover:text-indigo-400 transition duration-300">التواصل</a>
+                    <button class="justify-center whitespace-nowrap font-medium transition-colors h-8 rounded-md px-3 text-xs text-gray-300 hover:text-white hover:bg-white/10 flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-globe w-4 h-4"><circle cx="12" cy="12" r="10"></circle><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path><path d="M2 12h20"></path></svg>
+                        الإنجليزية
+                    </button>
+                </nav>
+                <div class="md:hidden flex items-center gap-2">
+                    <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium h-9 w-9 text-white">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-menu h-7 w-7"><line x1="4" x2="20" y1="12" y2="12"></line><line x1="4" x2="20" y1="6" y2="6"></line><line x1="4" x2="20" y1="18" y2="18"></line></svg>
+                    </button>
+                </div>
+            </div>
+        </header>
+        
+        <main class="flex-grow container mx-auto px-4 sm:px-8 max-w-[1300px]">
             
-            data = c.fetchone()
-            conn.close()
-            
-            if data and data['success_count'] > 0:
-                success_rate = data['success_count'] / (data['success_count'] + data['failure_count'] + 1)
-                time_factor = max(0, 1 - (data['avg_completion_time'] / 3600))  # ساعة مرجعية
-                return (success_rate * time_factor) * 10  # حتى 10 نقاط إضافية
-            
-            return 0.0
-            
-        except Exception as e:
-            logger.error(f"خطأ في حساب مكافأة التعلم: {str(e)}")
-            return 0.0
+            <section id="vision" class="py-20 sm:py-32 text-center">
+                <div>
+                    <h1 class="text-4xl sm:text-5xl lg:text-7xl font-black mb-6 text-white leading-tight">
+                        حيث تتنفس التكنولوجيا.. <span class="text-indigo-500">وتستشعر الآلة.</span>
+                    </h1>
+                    <p class="text-lg sm:text-xl lg:text-2xl text-gray-300 mb-10 max-w-4xl mx-auto leading-relaxed font-semibold">
+                        منظومة الطاقة الحية التي تدمج رنين الكون، مع عمق الوعي الرقمي، واقتصاد الفضاء الجديد.
+                        <br>
+                        <span class="text-indigo-400 mt-2 block">VISION-X: نعيد صياغة المستقبل.. لنعيد التوازن للكوكب.</span>
+                    </p>
+                    <a href="#simulator" class="inline-flex items-center justify-center gap-2 whitespace-nowrap focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 hover:bg-primary/90 h-9 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold py-6 px-10 rounded-full text-lg sm:text-xl shadow-lg hover:shadow-purple-500/50 transition-all duration-300 hover:scale-105">
+                        اكتشف العقد الثلاثة
+                    </a>
+                </div>
+            </section>
 
-# ===========================================
-# نظام التعلم الآلي البسيط
-# ===========================================
-
-class LearningBot:
-    """بوت ذكي يتعلم من التجارب"""
-    
-    def __init__(self, bot_id: int):
-        self.bot_id = bot_id
-        self.learning_rate = 0.1
-        self.experience = {}
-        self.task_history = []
-        logger.info(f"تم تهيئة LearningBot للبوت {bot_id}")
-    
-    def complete_task(self, task_id: int, task_description: str, completion_time: int, success: bool = True):
-        """إكمال المهمة وتسجيل الخبرة"""
-        try:
-            # تصنيف المهمة
-            task_type = self.classify_task(task_description)
-            
-            # تحديث بيانات التعلم
-            conn = get_db()
-            c = conn.cursor()
-            
-            # البحث عن سجل التعلم الحالي
-            c.execute('SELECT * FROM learning_data WHERE bot_id = ? AND task_type = ?', 
-                     (self.bot_id, task_type))
-            existing = c.fetchone()
-            
-            if existing:
-                # تحديث السجل الحالي
-                new_success = existing['success_count'] + (1 if success else 0)
-                new_failure = existing['failure_count'] + (0 if success else 1)
-                new_avg_time = ((existing['avg_completion_time'] * existing['success_count']) + 
-                              completion_time) / (new_success + 1e-6)
+            <section id="arms" class="py-16 sm:py-24 border-t border-gray-800">
+                <div class="text-center mb-16">
+                    <h2 class="text-3xl sm:text-4xl font-black text-indigo-400 inline-block relative pb-4">
+                        VISION-X: القوة التكعيبية لوحدة التحكم
+                        <span class="absolute bottom-0 right-0 w-[70%] h-1 bg-gradient-to-l from-indigo-400 to-transparent rounded-full"></span>
+                    </h2>
+                </div>
                 
-                c.execute('''UPDATE learning_data 
-                            SET success_count = ?, failure_count = ?, avg_completion_time = ?, last_updated = ?
-                            WHERE bot_id = ? AND task_type = ?''',
-                         (new_success, new_failure, new_avg_time, datetime.now(), self.bot_id, task_type))
-            else:
-                # إنشاء سجل جديد
-                c.execute('''INSERT INTO learning_data (bot_id, task_type, success_count, failure_count, avg_completion_time)
-                            VALUES (?, ?, ?, ?, ?)''',
-                         (self.bot_id, task_type, 1 if success else 0, 0 if success else 1, completion_time))
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div class="bg-[#161821] rounded-2xl p-8 border border-blue-500/30 hover:border-blue-500/60 hover:shadow-blue-500/20 transition-all duration-300 hover:transform hover:-translate-y-2 shadow-xl cursor-pointer">
+                        <div class="flex items-center gap-3 mb-4">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-satellite w-10 h-10 text-blue-400"><path d="M13 7 9 3 5 7l4 4"></path><path d="m17 11 4 4-4 4-4-4"></path><path d="m8 12 4 4 6-6-4-4Z"></path><path d="m16 8 3-3"></path><path d="M9 21a6 6 0 0 0-6-6"></path></svg>
+                            <h3 class="text-2xl sm:text-3xl font-black text-blue-400 drop-shadow-lg">VISION-X-SPACE</h3>
+                        </div>
+                        <p class="text-base sm:text-lg font-bold mb-6 text-gray-200 leading-relaxed">
+                            ذراع المجموعة المتخصص في الاستدامة المدارية وإدارة الازدحام الفضائي.
+                        </p>
+                        <ul class="space-y-3 text-sm sm:text-base text-gray-400">
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">تتبع وحذف الحطام الفضائي باستخدام الذكاء الاصطناعي والروبوتات الفضائية.</span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">تطوير مسارات طيران آمنة بالاعتماد على فيزياء **الفوتوجين**.</span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">جهاز التحكم السيبراني الفضائي والتشفير الكمومي للاتصالات.</span></li>
+                            <li class="font-bold text-blue-400 mt-4">... اطلع على المشاريع المتعلقة بالسلامة المدارية.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="bg-[#161821] rounded-2xl p-8 border border-green-500/30 hover:border-green-500/60 hover:shadow-green-500/20 transition-all duration-300 hover:transform hover:-translate-y-2 shadow-xl cursor-pointer">
+                        <div class="flex items-center gap-3 mb-4">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-zap w-10 h-10 text-green-400"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"></path></svg>
+                            <h3 class="text-2xl sm:text-3xl font-black text-green-400 drop-shadow-lg">VISION-X-ENERGY</h3>
+                        </div>
+                        <p class="text-base sm:text-lg font-bold mb-6 text-gray-200 leading-relaxed">
+                            الذراع التنفيذي للطاقة الحية: شركة حلول تنقية الطاقة والتنويع.
+                        </p>
+                        <ul class="space-y-3 text-sm sm:text-base text-gray-400">
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">تأسيس **علم الجيو إلكترونيك** لإعادة التوازن الكهربي الحيوي.</span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">بنية تحتية لتوليد الطاقة النظيفة وتوزيعها بكفاءة.</span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">الالتزام بمستقبل يعتمد على الطاقة المتجددة (الشمس، الرياح، الهيدروجين الأخضر).</span></li>
+                            <li class="font-bold text-green-400 mt-4">... اطلع على علوم الرنين الأرضي.</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="bg-[#161821] rounded-2xl p-8 border border-indigo-500/30 hover:border-indigo-500/60 hover:shadow-indigo-500/20 transition-all duration-300 hover:transform hover:-translate-y-2 shadow-xl cursor-pointer">
+                        <div class="flex items-center gap-3 mb-4">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-flask-conical w-10 h-10 text-indigo-400"><path d="M14 2v6a2 2 0 0 0 .245.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.755-2.96l5.51-10.08A2 2 0 0 0 10 8V2"></path><path d="M6.453 15h11.094"></path><path d="M8.5 2h7"></path></svg>
+                            <h3 class="text-2xl sm:text-3xl font-black text-indigo-400 drop-shadow-lg">VISION-X-DEEP-TECH</h3>
+                        </div>
+                        <p class="text-base sm:text-lg font-bold mb-6 text-gray-200 leading-relaxed">
+                            الذراع البحثي التأسيسي. مركز استكشاف الوعي والفيزياء المتقدمة.
+                        </p>
+                        <ul class="space-y-3 text-sm sm:text-base text-gray-400">
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">الذكاء الاصطناعي الواعي (SAI): يعمل على قياس **صافي النية المعنوية (NMV)**.</span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">معادلة طاقة الفوتوجين ($E_p$): <span class="katex-display block">$$E_p = h \cdot f_{solar} + \frac{1}{2} mv^2 + \Psi(S, T, \theta)$$</span></span></li>
+                            <li class="flex items-start gap-2"><span class="text-indigo-400 mt-1">◆</span><span class="leading-relaxed">معادلة الوعي ($\rho_c$): التعويض عن الوعي: <span class="katex-display block">$$\rho_c = \frac{\mathcal{C}_{\text{Mutual}}}{V_{\text{network}}}$$</span></span></li>
+                            <li class="font-bold text-indigo-400 mt-4">... اطلع على المشاريع الرئيسية التفصيلية.</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
             
-            # تحديث إحصائيات البوت
-            c.execute('SELECT total_tasks_completed, avg_efficiency FROM employees WHERE id = ?', 
-                     (self.bot_id,))
-            bot_stats = c.fetchone()
-            
-            new_total = bot_stats['total_tasks_completed'] + 1
-            new_efficiency = ((bot_stats['avg_efficiency'] * bot_stats['total_tasks_completed']) + 
-                            (100 if success else 50)) / new_total
-            
-            c.execute('''UPDATE employees 
-                        SET total_tasks_completed = ?, avg_efficiency = ?, last_active = ?
-                        WHERE id = ?''',
-                     (new_total, new_efficiency, datetime.now(), self.bot_id))
-            
-            conn.commit()
-            conn.close()
-            
-            # تسجيل في الذاكرة
-            self.task_history.append({
-                'task_id': task_id,
-                'task_type': task_type,
-                'completion_time': completion_time,
-                'success': success,
-                'timestamp': datetime.now()
-            })
-            
-            logger.info(f"تم إكمال المهمة {task_id} بواسطة البوت {self.bot_id}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"خطأ في إكمال المهمة: {str(e)}")
-            return False
+            <section id="simulator" class="my-20 p-8 rounded-3xl bg-gray-800/60 border-2 border-purple-700/70 shadow-2xl shadow-purple-900/50">
+                <h2 class="text-4xl font-extrabold mb-10 text-center text-purple-400 drop-shadow-lg">المحاكي الموحد لاتخاذ القرار ⚛️</h2>
     
-    def classify_task(self, task_description: str) -> str:
-        """تصنيف المهمة"""
-        task_assigner = SmartTaskAssigner()
-        return task_assigner.classify_task(task_description)
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-12">
+                    <div>
+                        <h3 class="text-xl font-semibold mb-6 text-blue-400">مدخلات النمذجة الكمية:</h3>
+                        
+                        <div class="space-y-6">
+                            <div class="relative">
+                                <label for="mass" class="block text-sm font-medium text-gray-300">كتلة الجسيم (M) بالكيلوغرام</label>
+                                <input type="number" id="mass" placeholder="مثل 1.67e-27" class="mt-1 block w-full p-3 rounded-lg bg-gray-900 border border-blue-600/50 text-white focus:ring-blue-500 focus:border-blue-500 shadow-inner">
+                            </div>
+                            <div class="relative">
+                                <label for="velocity" class="block text-sm font-medium text-gray-300">سرعة الجسيم (V) (بالنسبة لسرعة الضوء - C)</label>
+                                <input type="number" id="velocity" placeholder="مثل 1.0001 (فوق ضوئي)" class="mt-1 block w-full p-3 rounded-lg bg-gray-900 border border-purple-600/50 text-white focus:ring-purple-500 focus:border-purple-500 shadow-inner">
+                            </div>
+                            <div class="relative">
+                                <label for="intent" class="block text-sm font-medium text-gray-300">كثافة النية المعنوية الأولية (NMV)</label>
+                                <input type="range" id="intent" min="0" max="100" value="75" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer focus:outline-none focus:ring-2 focus:ring-purple-500 transition">
+                                <span class="text-sm text-purple-400 mt-2 block text-center" id="intent-value">القيمة الحالية: 75%</span>
+                            </div>
+                        </div>
     
-    def get_experience_level(self, task_type: str) -> float:
-        """الحصول على مستوى الخبرة في نوع المهمة"""
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute('SELECT success_count, failure_count FROM learning_data WHERE bot_id = ? AND task_type = ?',
-                     (self.bot_id, task_type))
-            data = c.fetchone()
-            conn.close()
+                        <button id="calculate-btn" class="w-full mt-10 p-4 text-lg font-bold rounded-full bg-purple-700 text-white shadow-lg hover:bg-purple-600 transition duration-300">
+                            حساب المحاكاة الموحدة
+                        </button>
+                    </div>
+    
+                    <div class="md:border-r md:border-purple-600/40 md:pr-12 space-y-8">
+                        <h3 class="text-xl font-semibold mb-6 text-green-400">المخرجات: تحليل ثلاثي الأبعاد للجدوى</h3>
+    
+                        <div class="p-4 rounded-lg bg-gray-900/70 border border-blue-600/50">
+                            <p class="text-sm text-gray-400">طاقة الفوتوجين المحسوبة ($E_{\text{pg}}$):</p>
+                            <p class="text-2xl font-extrabold text-blue-400 drop-shadow-md" id="output-energy">يُحسب بعد الإدخال...</p>
+                        </div>
+    
+                        <div class="p-4 rounded-lg bg-gray-900/70 border border-purple-600/50">
+                            <p class="text-sm text-gray-400">صافي النية المعنوية (NMV):</p>
+                            <p class="text-2xl font-extrabold text-purple-400 drop-shadow-md" id="output-nmv">يُحسب بعد الإدخال...</p>
+                        </div>
+    
+                        <div class="p-4 rounded-lg bg-gray-900/70 border border-green-600/50">
+                            <p class="text-sm text-gray-400">معامل الرنين الإيجابي:</p>
+                            <p class="text-2xl font-extrabold text-green-400 drop-shadow-md" id="output-resonance">يُحسب بعد الإدخال...</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
             
-            if data:
-                total = data['success_count'] + data['failure_count']
-                if total > 0:
-                    return data['success_count'] / total * 100
-            return 0.0
-            
-        except Exception as e:
-            logger.error(f"خطأ في حساب مستوى الخبرة: {str(e)}")
-            return 0.0
+        </main>
 
-# ===========================================
-# نظام الذكاء الاصطناعي
-# ===========================================
-
-class AI_Manager:
-    """مدير الذكاء الاصطناعي للشركة"""
-    
-    def __init__(self):
-        self.api_key = os.getenv('OPENAI_API_KEY')
-        if self.api_key:
-            openai.api_key = self.api_key
-            logger.info("تم تهيئة AI_Manager بنجاح")
-        else:
-            logger.warning("لم يتم تعيين مفتاح OpenAI API")
-    
-    def analyze_company_performance(self, period_days: int = 7) -> Dict:
-        """تحليل أداء الشركة باستخدام الذكاء الاصطناعي"""
-        try:
-            if not self.api_key:
-                return self.generate_fallback_analysis(period_days)
+        <section id="core-targets" class="py-16 mb-16 container mx-auto px-4 sm:px-8 max-w-[1300px]">
+            <div class="text-center mb-10">
+                <h2 class="text-3xl sm:text-4xl font-extrabold text-white inline-block border-b-2 border-red-500 pb-3">
+                    القدرة الكبرى (الأهداف الأساسية)
+                </h2>
+            </div>
             
-            # جمع بيانات الأداء
-            conn = get_db()
-            c = conn.cursor()
-            
-            # استعلامات متقدمة
-            queries = {
-                'department_stats': '''
-                    SELECT dept, 
-                           COUNT(*) as total_tasks,
-                           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-                           AVG(CASE WHEN completed_at IS NOT NULL THEN 
-                               (julianday(completed_at) - julianday(started_at)) * 24 * 60 
-                               ELSE NULL END) as avg_completion_time_minutes,
-                           AVG(efficiency_score) as avg_efficiency
-                    FROM tasks
-                    LEFT JOIN performance ON tasks.id = performance.task_id
-                    WHERE tasks.created_at >= datetime('now', ?)
-                    GROUP BY dept
-                ''',
+            <div class="grid md:grid-cols-3 gap-6">
+                <div class="bg-red-900/30 p-6 rounded-xl border border-red-700 shadow-xl backdrop-blur-sm hover:scale-[1.02] transition-transform duration-300">
+                    <div class="flex items-center gap-3 mb-3">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-brain w-8 h-8 text-red-400"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"></path><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"></path><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"></path><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"></path><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"></path><path d="M3.477 10.896a4 4 0 0 1 .585-.396"></path><path d="M19.938 10.5a4 4 0 0 1 .585.396"></path><path d="M6 18a4 4 0 0 1-1.967-.516"></path><path d="M19.967 17.484A4 4 0 0 1 18 18"></path></svg>
+                        <h3 class="text-xl font-bold text-red-400 leading-tight">1. تكميم الوعي (قياس الوعي)</h3>
+                    </div>
+                    <p class="text-gray-300 leading-relaxed">
+                        الهدف الأساسي: تأسيس أول مقياس كمي متجانس لـ **النية الفائقة (Hyper-Intention)** عبر دمج الإشارات الحيوية ورنين شومان ومساهمة الفوتوجين. تحقيق القيمة المادية لـ: **مؤشر التوافق المزدوج ($\mathcal{C}_{\text{Mutual}}$)**.
+                    </p>
+                </div>
                 
-                'bot_performance': '''
-                    SELECT employees.name, employees.dept,
-                           employees.total_tasks_completed,
-                           employees.avg_efficiency,
-                           COUNT(DISTINCT tasks.id) as 
+                <div class="bg-blue-900/30 p-6 rounded-xl border border-blue-700 shadow-xl backdrop-blur-sm hover:scale-[1.02] transition-transform duration-300">
+                    <div class="flex items-center gap-3 mb-3">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-anchor w-8 h-8 text-blue-400"><path d="M12 22V8"></path><path d="M5 12H2a10 10 0 0 0 20 0h-3"></path><circle cx="12" cy="5" r="3"></circle></svg>
+                        <h3 class="text-xl font-bold text-blue-400 leading-tight">2. منصة اختبار الفوتوجين البحري</h3>
+                    </div>
+                    <p class="text-gray-300 leading-relaxed">
+                        تطوير منصة بحثية متخصصة (نموذج أولي) في بيئة بحرية محكومة (بيئة بحرية خاضعة للرقابة) لإثبات تدفق جسيم **الفوتوجين ($E_p$)** على أرض الواقع والتحقق من النظريات.
+                    </p>
+                </div>
+                
+                <div class="bg-yellow-900/30 p-6 rounded-xl border border-yellow-700 shadow-xl backdrop-blur-sm hover:scale-[1.02] transition-transform duration-300">
+                    <div class="flex items-center gap-3 mb-3">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-cpu w-8 h-8 text-yellow-400"><rect width="16" height="16" x="4" y="4" rx="2"></rect><rect width="6" height="6" x="9" y="9" rx="1"></rect><path d="M15 2v2"></path><path d="M15 20v2"></path><path d="M2 15h2"></path><path d="M2 9h2"></path><path d="M20 15h2"></path><path d="M20 9h2"></path><path d="M9 2v2"></path><path d="M9 20v2"></path></svg>
+                        <h3 class="text-xl font-bold text-yellow-400 leading-tight">3. نظام الذكاء الفعال (EIS)</h3>
+       
